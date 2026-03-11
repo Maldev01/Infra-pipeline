@@ -1,0 +1,208 @@
+name: private-eks-create
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      confirm_apply:
+        description: "Type APPLY to confirm terraform apply"
+        required: true
+        default: "NO"
+
+permissions:
+  id-token: write   # REQUIRED for OIDC
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+
+  plan:
+    environment: EKS
+    name: Terraform Plan
+    runs-on: [self-hosted]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ✅ OIDC Authentication (Replaces static keys)
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify required tools
+        shell: bash
+        run: |
+          set -e
+          for cmd in terraform aws jq; do
+            if ! command -v $cmd >/dev/null; then
+              echo "$cmd not found on runner"
+              exit 1
+            fi
+          done
+          terraform -version
+          aws --version
+          jq --version
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan (create tfplan)
+        id: tfplan
+        run: terraform plan -out=tfplan -input=false
+
+      - name: Upload tfplan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+
+
+  apply:
+    environment: EKS
+    name: Terraform Apply (manual)
+    runs-on: [self-hosted]
+    needs: plan
+    timeout-minutes: 180
+
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      inputs.confirm_apply == 'APPLY'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ✅ OIDC Authentication
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download tfplan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: .
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Export Terraform outputs (JSON)
+        id: tfout
+        run: |
+          terraform output -json > tfoutputs.json
+
+          BASTION_ID=$(jq -r '.bastion_instance_id.value' tfoutputs.json)
+          BASTION_ROLE_ARN=$(jq -r '.bastion_role_arn.value' tfoutputs.json)
+          CLUSTER_NAME=$(jq -r '.eks_cluster_name.value' tfoutputs.json)
+
+          echo "BASTION_ID=${BASTION_ID}" >> $GITHUB_OUTPUT
+          echo "BASTION_ROLE_ARN=${BASTION_ROLE_ARN}" >> $GITHUB_OUTPUT
+          echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Success message
+        run: echo "Terraform apply finished successfully."
+
+      - name: Wait for SSM agent on bastion
+        env:
+          BASTION_ID: ${{ steps.tfout.outputs.BASTION_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -z "$BASTION_ID" ] || [ "$BASTION_ID" = "null" ]; then
+            echo "BASTION_ID is empty — check terraform outputs"
+            exit 1
+          fi
+
+          echo "Waiting for SSM managed-instance registration for $BASTION_ID..."
+          for i in {1..30}; do
+            COUNT=$(aws ssm describe-instance-information \
+              --filters Key=InstanceIds,Values=${BASTION_ID} \
+              --region ${AWS_REGION} | jq -r '.InstanceInformationList | length')
+
+            echo "Attempt $i: SSM reports $COUNT instances"
+
+            if [ "$COUNT" -gt 0 ]; then
+              echo "SSM managed-instance found"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM managed-instance to register"
+          exit 1
+
+      - name: Verify EKS cluster is ACTIVE
+        env:
+          CLUSTER_NAME: ${{ steps.tfout.outputs.CLUSTER_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -z "$CLUSTER_NAME" ] || [ "$CLUSTER_NAME" = "null" ]; then
+            echo "CLUSTER_NAME is empty — check terraform outputs"
+            exit 1
+          fi
+
+          echo "Waiting for EKS cluster $CLUSTER_NAME to be ACTIVE..."
+          for i in {1..30}; do
+            STATUS=$(aws eks describe-cluster \
+              --name "$CLUSTER_NAME" \
+              --query "cluster.status" \
+              --output text \
+              --region ${AWS_REGION} 2>/dev/null || echo "NOTFOUND")
+
+            echo "Attempt $i: cluster status = $STATUS"
+
+            if [ "$STATUS" = "ACTIVE" ]; then
+              echo "Cluster is ACTIVE"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Cluster did not become ACTIVE in time"
+          exit 1
+
+      - name: Ensure cluster auth supports Access Entries
+        env:
+          CLUSTER_NAME: ${{ steps.tfout.outputs.CLUSTER_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws eks update-cluster-config \
+            --name "$CLUSTER_NAME" \
+            --access-config authenticationMode=API_AND_CONFIG_MAP \
+            --region ${AWS_REGION} || true
+
+      - name: Validate Access Entry & Associated Policy
+        env:
+          CLUSTER_NAME: ${{ steps.tfout.outputs.CLUSTER_NAME }}
+          PRINCIPAL_ARN: ${{ steps.tfout.outputs.BASTION_ROLE_ARN }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "Listing access entries for cluster ${CLUSTER_NAME}"
+          aws eks list-access-entries \
+            --cluster-name "${CLUSTER_NAME}" \
+            --region ${AWS_REGION} || true
+
+          if [ -n "${PRINCIPAL_ARN}" ] && [ "${PRINCIPAL_ARN}" != "null" ]; then
+            echo "Listing policies associated to ${PRINCIPAL_ARN}"
+            aws eks list-associated-access-policies \
+              --cluster-name "${CLUSTER_NAME}" \
+              --principal-arn "${PRINCIPAL_ARN}" \
+              --region ${AWS_REGION} || true
+          else
+            echo "Warning: PRINCIPAL_ARN empty — check terraform outputs"
+          fi
