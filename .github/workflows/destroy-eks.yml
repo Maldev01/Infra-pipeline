@@ -8,6 +8,10 @@ on:
         required: true
         default: "NO"
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
@@ -18,8 +22,7 @@ jobs:
     runs-on: [self-hosted]
     timeout-minutes: 180
 
-    # Only run the job if confirm_destroy == "DESTROY"
-    if: >
+    if: |
       github.event_name == 'workflow_dispatch' &&
       inputs.confirm_destroy == 'DESTROY'
 
@@ -27,37 +30,36 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (from Secrets)
-        shell: bash
-        run: |
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+      # ✅ OIDC Authentication (replaces static credentials)
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Verify required tools
         shell: bash
         run: |
-          if ! command -v terraform >/dev/null; then
-            echo "terraform not found on runner"
-            exit 1
-          fi
+          set -e
+          for cmd in terraform aws jq; do
+            if ! command -v $cmd >/dev/null; then
+              echo "$cmd not found on runner"
+              exit 1
+            fi
+          done
+
           terraform -version
           aws --version
+          jq --version
 
       - name: Terraform Init
-        shell: bash
         run: terraform init -input=false
-        working-directory: .
 
       - name: Terraform Plan Destroy (preview)
-        shell: bash
         run: terraform plan -destroy -out=tf-destroy -input=false
-        working-directory: .
 
       - name: Terraform Apply Destroy
-        shell: bash
         run: terraform apply -input=false -auto-approve tf-destroy
-        working-directory: .
 
       - name: Success message
-        run: echo "Terraform destroy completed."
+        run: echo "Terraform destroy completed successfully."
