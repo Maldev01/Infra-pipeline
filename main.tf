@@ -57,17 +57,23 @@ resource "aws_instance" "bastion" {
   user_data = <<-EOF
     #!/bin/bash
     sudo apt update -y || true
+
     # install unzip
     sudo apt install unzip -y || true
     # install awscli v2
     curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
     unzip -o /tmp/awscliv2.zip -d /tmp
     /tmp/aws/install || true
+
     # install kubectl
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" || true
     install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl || true
     mkdir -p /home/ubuntu/.kube
     chown ubuntu:ubuntu /home/ubuntu/.kube || true
+
+    # install helm
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    helm version
   EOF
 
   tags = merge(var.tags, { Name = "${var.name}-bastion" })
