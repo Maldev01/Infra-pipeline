@@ -13,7 +13,7 @@ variable "tags" {}
 
 variable "instance_types" { 
   type = list(string)
-  default = ["t3.micro"]
+  default = ["t3.medium"]
    }
 
 variable "ami_type" { 
